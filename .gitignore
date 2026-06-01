@@ -1,0 +1,7 @@
+# 工具生成的报告
+AD-Security-Report-*.html
+*.html
+
+# 临时文件
+*.tmp
+*.log
