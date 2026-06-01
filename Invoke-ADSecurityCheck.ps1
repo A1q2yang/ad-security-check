@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     域环境安全检查工具 (AD Security Assessment Tool)
 
