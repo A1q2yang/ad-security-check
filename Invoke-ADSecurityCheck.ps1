@@ -1188,6 +1188,556 @@ function Test-GppPassword {
 #endregion
 
 
+#region ========================= 检查项：扩展风险（AD CS / 加密 / 机密 / 卫生）=========================
+
+# ---- 低权限/宽泛主体 SID 表（用于判断"授权过宽"） ----
+function Get-LowPrivSidTable {
+    $t = @{
+        'S-1-1-0'      = 'Everyone'
+        'S-1-5-7'      = 'Anonymous Logon'
+        'S-1-5-11'     = 'Authenticated Users'
+        'S-1-5-32-545' = 'Users (内置)'
+    }
+    if ($script:DomainSid) {
+        $t["$($script:DomainSid)-513"] = 'Domain Users'
+        $t["$($script:DomainSid)-515"] = 'Domain Computers'
+    }
+    return $t
+}
+
+# ---- 检测某对象 ACL 中，低权限主体是否拥有"危险/宽泛"权限 ----
+function Get-BroadAclGrants {
+    param(
+        [Parameter(Mandatory)] [string]$Dn,
+        [string[]]$ExtendedRightGuids = @(),   # 视为危险的扩展权限 GUID（小写）
+        [switch]$IncludeWrite                   # 是否把 Write* 视为危险
+    )
+    $lowPriv = Get-LowPrivSidTable
+    $found = @()
+    try {
+        $de = Get-DirectoryEntry $Dn
+        $sd = $de.ObjectSecurity
+        if ($null -eq $sd) { $de.Dispose(); return @() }
+        foreach ($ace in $sd.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
+            if ($ace.AccessControlType -ne 'Allow') { continue }
+            $sid = $ace.IdentityReference.Value
+            if (-not $lowPriv.ContainsKey($sid)) { continue }
+            $rights = [string]$ace.ActiveDirectoryRights
+            $objType = ([string]$ace.ObjectType).ToLower()
+            $why = $null
+            if ($rights -match 'GenericAll') { $why = 'GenericAll(完全控制)' }
+            elseif ($rights -match 'ExtendedRight' -and $objType -eq '00000000-0000-0000-0000-000000000000') { $why = 'AllExtendedRights' }
+            elseif ($rights -match 'ExtendedRight' -and ($ExtendedRightGuids -contains $objType)) { $why = '指定扩展权限(如 Enroll)' }
+            elseif ($IncludeWrite -and ($rights -match 'WriteDacl|WriteOwner|GenericWrite|WriteProperty')) { $why = $rights }
+            if ($why) { $found += @{ identity = $lowPriv[$sid]; right = $why } }
+        }
+        $de.Dispose()
+    } catch {}
+    return $found
+}
+
+function Test-AdcsTemplates {
+    Write-Step "检查 AD CS 证书模板漏洞 (ESC1/2/3/4) ..." 'RUN'
+    try {
+        if ([string]::IsNullOrEmpty($script:ConfigDN)) { Write-Step "无 Configuration NC，跳过 AD CS" 'WARN'; return }
+        $pkiBase = "CN=Public Key Services,CN=Services,$($script:ConfigDN)"
+        $tplRoot = "CN=Certificate Templates,$pkiBase"
+        $caRoot  = "CN=Enrollment Services,$pkiBase"
+
+        # 1) 枚举企业 CA 及其已发布模板（仅评估已发布模板，降低误报）
+        $publishedTpls = @{}
+        $caList = @()
+        try {
+            $caRes = Invoke-LdapQuery -Filter '(objectClass=pKIEnrollmentService)' -Properties @('name','dNSHostName','certificateTemplates') -SearchRoot $caRoot
+            foreach ($r in $caRes) {
+                $caList += @{ 'CA' = [string](Get-Prop $r 'name'); '主机' = [string](Get-Prop $r 'dNSHostName') }
+                foreach ($t in (Get-PropAll $r 'certificateTemplates')) { $publishedTpls[[string]$t] = $true }
+            }
+        } catch {}
+
+        if ($caList.Count -eq 0) {
+            Add-Finding -Category 'AD CS' -Title '未发现 AD CS 证书颁发机构' -Severity 'Info' -Passed $true -Description "域内未检测到企业 CA (pKIEnrollmentService)。"
+            Write-Step "AD CS 检查完成（无 CA）" 'OK'
+            return
+        }
+        Add-Finding -Category 'AD CS' -Title "发现 $($caList.Count) 个证书颁发机构 (CA)" -Severity 'Info' -Passed $true -Description "企业 CA 清单。" -Affected $caList
+
+        $clientAuthEku  = @('1.3.6.1.5.5.7.3.2','1.3.6.1.5.2.3.4','1.3.6.1.4.1.311.20.2.2','2.5.29.37.0')
+        $anyPurposeEku  = '2.5.29.37.0'
+        $enrollAgentEku = '1.3.6.1.4.1.311.20.2.1'
+        $enrollGuid     = '0e10c968-78fb-11d2-90d4-00c04f79dc55'
+        $autoEnrollGuid = 'a05b8cc2-17bc-4802-a710-e7c15ab866a2'
+
+        $vulns = @()
+        $tplRes = Invoke-LdapQuery -Filter '(objectClass=pKICertificateTemplate)' `
+            -Properties @('name','displayName','pKIExtendedKeyUsage','msPKI-Certificate-Name-Flag','msPKI-Enrollment-Flag','msPKI-RA-Signature') -SearchRoot $tplRoot
+        foreach ($r in $tplRes) {
+            $name = [string](Get-Prop $r 'name')
+            if (-not $publishedTpls.ContainsKey($name)) { continue }
+            $nameFlag = [int](Get-Prop $r 'msPKI-Certificate-Name-Flag' 0)
+            $enrollFlag = [int](Get-Prop $r 'msPKI-Enrollment-Flag' 0)
+            $raSig = [int](Get-Prop $r 'msPKI-RA-Signature' 0)
+            $ekus = @(Get-PropAll $r 'pKIExtendedKeyUsage')
+            $suppliesSubject = (($nameFlag -band 0x1) -eq 0x1)
+            $managerApproval = (($enrollFlag -band 0x2) -eq 0x2)
+            $hasClientAuth = $false; foreach ($e in $ekus) { if ($clientAuthEku -contains [string]$e) { $hasClientAuth = $true } }
+            $noEku = ($ekus.Count -eq 0)
+            $hasAnyPurpose = ($ekus -contains $anyPurposeEku)
+            $hasEnrollAgent = ($ekus -contains $enrollAgentEku)
+            $dn = "CN=$name,$tplRoot"
+
+            $enrollGrants = Get-BroadAclGrants -Dn $dn -ExtendedRightGuids @($enrollGuid,$autoEnrollGuid)
+            $whoEnroll = (($enrollGrants | ForEach-Object { $_.identity }) | Select-Object -Unique) -join ', '
+
+            $esc = @()
+            if ($enrollGrants.Count -gt 0 -and -not $managerApproval -and $raSig -le 0) {
+                if ($suppliesSubject -and ($hasClientAuth -or $noEku)) { $esc += 'ESC1' }
+                if ($hasAnyPurpose -or $noEku) { $esc += 'ESC2' }
+                if ($hasEnrollAgent) { $esc += 'ESC3' }
+            }
+            if ($esc.Count -gt 0) {
+                $vulns += @{ '模板'=$name; '风险'=($esc -join ', '); '低权限主体'=$whoEnroll; '可自定义主体(SAN)'=$(if($suppliesSubject){'是'}else{'否'}); '需审批'=$(if($managerApproval){'是'}else{'否'}) }
+            }
+            $writeGrants = Get-BroadAclGrants -Dn $dn -IncludeWrite
+            if ($writeGrants.Count -gt 0) {
+                $vulns += @{ '模板'=$name; '风险'='ESC4(模板可被低权限改写)'; '低权限主体'=(($writeGrants | ForEach-Object { $_.identity }) | Select-Object -Unique) -join ', '; '可自定义主体(SAN)'='-'; '需审批'='-' }
+            }
+        }
+
+        if ($vulns.Count -gt 0) {
+            Add-Finding -Category 'AD CS' -Title "存在可被滥用的证书模板（$($vulns.Count) 项）" -Severity 'Critical' `
+                -Description "以下已发布证书模板存在配置缺陷，低权限用户可申请到用于身份冒充的证书并提权至域管理员（域接管）。ESC1=可自定义主体+客户端认证 EKU；ESC2=Any Purpose/无 EKU；ESC3=注册代理；ESC4=模板 ACL 可被低权限改写。本工具仅枚举配置，不申请证书。" `
+                -Affected $vulns `
+                -Remediation "移除模板上对 Domain Users/Authenticated Users 的申请/写权限；关闭 ENROLLEE_SUPPLIES_SUBJECT 或启用管理员审批/RA 签名；收紧 EKU；下架不需要的模板；CA 启用强证书绑定并打齐补丁。建议用 Certify/Certipy 复核 ESC5-ESC11/13/15。" `
+                -Reference "Certified Pre-Owned (ESC1-ESC4)"
+        } else {
+            Add-Finding -Category 'AD CS' -Title '未发现明显可滥用的证书模板' -Severity 'Info' -Passed $true -Description "已评估已发布模板的 ESC1/2/3/4 特征，未发现低权限可滥用项。"
+        }
+        Write-Step "AD CS 检查完成" 'OK'
+    } catch {
+        Write-Step "AD CS 检查失败: $($_.Exception.Message)" 'ERR'
+    }
+}
+
+function Test-WeakKerberosEncryption {
+    Write-Step "检查弱 Kerberos 加密类型 (RC4/DES) ..." 'RUN'
+    try {
+        $res = Invoke-LdapQuery -Filter '(&(objectCategory=person)(objectClass=user)(|(servicePrincipalName=*)(adminCount=1)))' `
+            -Properties @('sAMAccountName','msDS-SupportedEncryptionTypes','adminCount','servicePrincipalName','userAccountControl')
+        $rows = @()
+        foreach ($r in $res) {
+            $uac = [int](Get-Prop $r 'userAccountControl' 0)
+            if (Test-UacFlag $uac $script:UAC.ACCOUNTDISABLE) { continue }
+            $sam = [string](Get-Prop $r 'sAMAccountName')
+            if ($sam -eq 'krbtgt') { continue }
+            $raw = Get-Prop $r 'msDS-SupportedEncryptionTypes'
+            $isPriv = [int](Get-Prop $r 'adminCount' 0) -ge 1
+            $tp = $(if($isPriv){'特权'}else{'服务'})
+            if ($null -eq $raw) {
+                $rows += @{ '账户'=$sam; '类型'=$tp; '加密设置'='未配置(可能回退 RC4)' }
+            } else {
+                $et = [int]$raw
+                if (($et -band 0x3) -ne 0) { $rows += @{ '账户'=$sam; '类型'=$tp; '加密设置'='允许 DES(极弱)' } }
+                elseif (($et -band 0x4) -ne 0 -and ($et -band 0x18) -eq 0) { $rows += @{ '账户'=$sam; '类型'=$tp; '加密设置'='仅 RC4(无 AES)' } }
+            }
+        }
+        if ($rows.Count -gt 0) {
+            Add-Finding -Category 'Kerberos / 加密' -Title "存在使用弱 Kerberos 加密的服务/特权账户（$($rows.Count) 个）" -Severity 'Medium' `
+                -Description "这些账户允许 DES 或仅 RC4（未启用 AES）。RC4/DES 票据更易被离线破解（配合 Kerberoasting），削弱了口令强度的保护。" `
+                -Affected $rows `
+                -Remediation "为账户配置 msDS-SupportedEncryptionTypes 启用 AES128/AES256（值含 0x18），并在域内逐步禁用 RC4/DES；服务账户尽量迁移 gMSA。" `
+                -Reference "RC4 弃用 / Kerberoasting 加固"
+        } else {
+            Add-Finding -Category 'Kerberos / 加密' -Title '未发现弱加密的服务/特权账户' -Severity 'Info' -Passed $true -Description "相关账户均已启用 AES 或未启用弱加密。"
+        }
+        Write-Step "弱加密检查完成" 'OK'
+    } catch {
+        Write-Step "弱加密检查失败: $($_.Exception.Message)" 'ERR'
+    }
+}
+
+function Test-HighRiskGroups {
+    Write-Step "检查高危但易被忽视的组 (DnsAdmins 等) ..." 'RUN'
+    try {
+        $groups = @(
+            @{ name='DnsAdmins'; sev='High'; risk='成员可让 DNS 服务(运行于 DC)加载任意 DLL，等同 DC 代码执行' },
+            @{ name='Group Policy Creator Owners'; sev='Medium'; risk='可创建/链接 GPO，潜在横向与提权' },
+            @{ name='Cert Publishers'; sev='Medium'; risk='可向用户对象/ NTAuth 发布证书，PKI 相关风险' },
+            @{ name='DnsUpdateProxy'; sev='Medium'; risk='DNS 记录可被任意覆盖（投毒）' }
+        )
+        $any = $false
+        foreach ($g in $groups) {
+            $gr = Invoke-LdapQuery -Filter "(&(objectCategory=group)(sAMAccountName=$($g.name)))" -Properties @('distinguishedName')
+            $dn = $null; foreach ($x in $gr) { $dn = [string](Get-Prop $x 'distinguishedName'); break }
+            if (-not $dn) { continue }
+            $mres = Invoke-LdapQuery -Filter "(memberOf:1.2.840.113556.1.4.1941:=$dn)" -Properties @('sAMAccountName','objectClass')
+            $rows = @()
+            foreach ($m in $mres) {
+                $classes = (Get-PropAll $m 'objectClass') -join ','
+                $type = if ($classes -match 'computer'){'计算机'} elseif ($classes -match 'group'){'组'} else {'用户'}
+                $rows += @{ '成员'=[string](Get-Prop $m 'sAMAccountName'); '类型'=$type }
+            }
+            if ($rows.Count -gt 0) {
+                $any = $true
+                Add-Finding -Category '特权账户' -Title "$($g.name) 组非空（$($rows.Count) 个成员）" -Severity $g.sev `
+                    -Description "$($g.risk)。请核实成员的业务必要性。" -Affected $rows `
+                    -Remediation "遵循最小权限，移除不必要成员；DnsAdmins 等高危组应尽量为空或仅含受控管理账户。" `
+                    -Reference "DnsAdmins DLL Injection 等"
+            }
+        }
+        if (-not $any) {
+            Add-Finding -Category '特权账户' -Title '高危易忽视组均为空' -Severity 'Info' -Passed $true -Description "DnsAdmins 等组未发现成员。"
+        }
+        Write-Step "高危组检查完成" 'OK'
+    } catch {
+        Write-Step "高危组检查失败: $($_.Exception.Message)" 'ERR'
+    }
+}
+
+function Test-SecretsInAttributes {
+    Write-Step "检查账户属性中的明文口令/可读机密 ..." 'RUN'
+    try {
+        $filter = '(&(objectClass=user)(|(description=*pass*)(description=*pwd*)(description=*密码*)(description=*口令*)(info=*pass*)(info=*pwd*)(info=*密码*)))'
+        $res = Invoke-LdapQuery -Filter $filter -Properties @('sAMAccountName','description','info')
+        $rows = @()
+        foreach ($r in $res) {
+            $d = [string](Get-Prop $r 'description'); $i = [string](Get-Prop $r 'info')
+            $rows += @{ '账户'=[string](Get-Prop $r 'sAMAccountName'); '可疑字段'=("$d $i").Trim() }
+        }
+        if ($rows.Count -gt 0) {
+            Add-Finding -Category '凭据窃取' -Title "账户描述/备注疑似含明文口令（$($rows.Count) 个）" -Severity 'High' `
+                -Description "description/info 等字段任意域用户可读，若包含口令将直接泄露凭据。" -Affected $rows `
+                -Remediation "清除字段中的口令信息并轮换相关账户口令；规范运维不要把口令写入对象属性。" `
+                -Reference "MITRE ATT&CK T1552 (Unsecured Credentials)"
+        } else {
+            Add-Finding -Category '凭据窃取' -Title '未在描述字段发现明文口令关键字' -Severity 'Info' -Passed $true -Description "未匹配到 pass/pwd/密码/口令 等关键字。"
+        }
+
+        $secretAttrs = 'userPassword','unixUserPassword','ms-Mcs-AdmPwd'
+        foreach ($attr in $secretAttrs) {
+            try {
+                $sr = Invoke-LdapQuery -Filter "($attr=*)" -Properties @('sAMAccountName',$attr)
+                $names = @(); foreach ($x in $sr) { $names += [string](Get-Prop $x 'sAMAccountName') }
+                if ($names.Count -gt 0) {
+                    $sev = if ($attr -eq 'ms-Mcs-AdmPwd') { 'High' } else { 'Medium' }
+                    Add-Finding -Category '凭据窃取' -Title "属性 $attr 存在且当前账户可读（$($names.Count) 个对象）" -Severity $sev `
+                        -Description "$attr 可能包含口令/本地管理员密码，当前执行账户能读取它，说明该属性的读取权限过宽。" `
+                        -Affected (@($names) | ForEach-Object { @{ '对象'=$_ } }) `
+                        -Remediation "收紧该属性读取 ACL；LAPS(ms-Mcs-AdmPwd) 应仅授权必要管理员可读；清理 userPassword 等历史明文属性。" `
+                        -Reference "LAPS ACL / Unsecured Credentials"
+                }
+            } catch {}
+        }
+        Write-Step "机密属性检查完成" 'OK'
+    } catch {
+        Write-Step "机密属性检查失败: $($_.Exception.Message)" 'ERR'
+    }
+}
+
+function Test-BuiltinAdminAndGuest {
+    Write-Step "检查内置 Administrator(RID500) 与 Guest 账户 ..." 'RUN'
+    try {
+        if (-not $script:DomainSid) { Write-Step "无域 SID，跳过" 'WARN'; return }
+        foreach ($pair in @(@{rid='500';kind='admin'}, @{rid='501';kind='guest'})) {
+            $sidStr = "$($script:DomainSid)-$($pair.rid)"
+            $sid = New-Object System.Security.Principal.SecurityIdentifier($sidStr)
+            $bytes = New-Object 'byte[]' $sid.BinaryLength; $sid.GetBinaryForm($bytes,0)
+            $hex = ($bytes | ForEach-Object { '\{0:x2}' -f $_ }) -join ''
+            $res = Invoke-LdapQuery -Filter "(objectSid=$hex)" -Properties @('sAMAccountName','pwdLastSet','lastLogonTimestamp','userAccountControl')
+            foreach ($r in $res) {
+                $sam = [string](Get-Prop $r 'sAMAccountName')
+                $uac = [int](Get-Prop $r 'userAccountControl' 0)
+                $enabled = -not (Test-UacFlag $uac $script:UAC.ACCOUNTDISABLE)
+                if ($pair.kind -eq 'admin') {
+                    $pwd = Convert-FileTimeToDate (Get-Prop $r 'pwdLastSet')
+                    $pwdAge = if ($pwd) { [math]::Round(((Get-Date)-$pwd).TotalDays) } else { $null }
+                    $issues = @()
+                    if ($sam -eq 'Administrator') { $issues += '未重命名(仍为 Administrator)' }
+                    if ($null -ne $pwdAge -and $pwdAge -gt 365) { $issues += "口令已 $pwdAge 天未更换" }
+                    if ($issues.Count -gt 0) {
+                        Add-Finding -Category '特权账户' -Title '内置管理员账户(RID 500)存在弱点' -Severity 'Medium' `
+                            -Description ("内置管理员：" + ($issues -join '；') + "。该账户权限极高且常被攻击者优先尝试，且无法被锁定。") `
+                            -Affected @(@{ '账户'=$sam; '口令年龄(天)'=$pwdAge }) `
+                            -Remediation "重命名内置管理员、设置超强口令并定期轮换；限制为应急使用；纳入 Protected Users 或标记不可委派；开启审计。" `
+                            -Reference "CIS / 内置管理员加固"
+                    } else {
+                        Add-Finding -Category '特权账户' -Title '内置管理员账户基本合规' -Severity 'Info' -Passed $true -Description "RID 500 已重命名且口令较新。"
+                    }
+                } else {
+                    if ($enabled) {
+                        Add-Finding -Category '账户卫生' -Title 'Guest(来宾)账户已启用' -Severity 'Medium' `
+                            -Description "来宾账户启用会提供弱身份/匿名访问入口。" -Affected @(@{ '账户'=$sam; '状态'='启用' }) `
+                            -Remediation "禁用 Guest 账户（默认应保持禁用）。" -Reference "CIS"
+                    } else {
+                        Add-Finding -Category '账户卫生' -Title 'Guest(来宾)账户已禁用' -Severity 'Info' -Passed $true -Description "来宾账户处于禁用状态。"
+                    }
+                }
+            }
+        }
+        Write-Step "内置账户检查完成" 'OK'
+    } catch {
+        Write-Step "内置账户检查失败: $($_.Exception.Message)" 'ERR'
+    }
+}
+
+function Test-PreWindows2000Access {
+    Write-Step "检查 Pre-Windows 2000 Compatible Access 组 ..." 'RUN'
+    try {
+        $sid = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-554')
+        $bytes = New-Object 'byte[]' $sid.BinaryLength; $sid.GetBinaryForm($bytes,0)
+        $hex = ($bytes | ForEach-Object { '\{0:x2}' -f $_ }) -join ''
+        $g = Invoke-LdapQuery -Filter "(objectSid=$hex)" -Properties @('member')
+        $risky = @()
+        foreach ($r in $g) {
+            foreach ($m in (Get-PropAll $r 'member')) {
+                $md = [string]$m
+                if ($md -match 'S-1-1-0' -or $md -match 'S-1-5-7') { $risky += @{ '成员(DN)'=$md } }
+            }
+        }
+        if ($risky.Count -gt 0) {
+            Add-Finding -Category '系统加固' -Title 'Pre-Windows 2000 Compatible Access 含宽泛主体' -Severity 'High' `
+                -Description "该组包含 Everyone/Anonymous Logon 时，会放宽匿名/低权限对目录的读取，便于攻击者匿名侦察（枚举用户、组、属性）。" `
+                -Affected $risky `
+                -Remediation "移除 Everyone/Anonymous Logon；仅在确有老系统兼容需求时保留必要主体，否则清空该组。" `
+                -Reference "Anonymous Enumeration 加固"
+        } else {
+            Add-Finding -Category '系统加固' -Title 'Pre-Windows 2000 组未含宽泛主体' -Severity 'Info' -Passed $true -Description "未发现 Everyone/Anonymous 成员。"
+        }
+        Write-Step "Pre-Windows 2000 检查完成" 'OK'
+    } catch {
+        Write-Step "Pre-Windows 2000 检查失败: $($_.Exception.Message)" 'ERR'
+    }
+}
+
+function Test-AnonymousLdapAccess {
+    Write-Step "检查匿名 LDAP / dsHeuristics ..." 'RUN'
+    try {
+        $dsDn = "CN=Directory Service,CN=Windows NT,CN=Services,$($script:ConfigDN)"
+        $res = Invoke-LdapQuery -Filter '(objectClass=*)' -Properties @('dSHeuristics') -SearchRoot $dsDn
+        $val = $null
+        foreach ($r in $res) { $val = [string](Get-Prop $r 'dSHeuristics'); break }
+        if ([string]::IsNullOrEmpty($val)) {
+            Add-Finding -Category '系统加固' -Title 'dsHeuristics 未设置（匿名 LDAP 默认禁用）' -Severity 'Info' -Passed $true -Description "未配置 dSHeuristics，匿名 LDAP 操作默认被禁止。"
+        } else {
+            $ch7 = if ($val.Length -ge 7) { $val.Substring(6,1) } else { '0' }
+            if ($ch7 -eq '2') {
+                Add-Finding -Category '系统加固' -Title '已允许匿名 LDAP 操作 (dsHeuristics 第7位=2)' -Severity 'High' `
+                    -Description "dSHeuristics 第 7 位为 2，允许匿名 LDAP 绑定/查询，攻击者无需凭据即可枚举目录信息。" `
+                    -Affected @(@{ 'dSHeuristics'=$val }) `
+                    -Remediation "将 dSHeuristics 第 7 位改回 0（禁止匿名 LDAP 操作）。" -Reference "Anonymous LDAP 加固"
+            } else {
+                Add-Finding -Category '系统加固' -Title 'dsHeuristics 未开启匿名 LDAP' -Severity 'Info' -Passed $true -Description "当前 dSHeuristics=$val，未允许匿名操作。"
+            }
+        }
+        Write-Step "匿名 LDAP 检查完成" 'OK'
+    } catch {
+        Write-Step "匿名 LDAP 检查失败: $($_.Exception.Message)" 'ERR'
+    }
+}
+
+function Test-DuplicateSpn {
+    Write-Step "检查重复 SPN ..." 'RUN'
+    try {
+        $res = Invoke-LdapQuery -Filter '(servicePrincipalName=*)' -Properties @('sAMAccountName','servicePrincipalName')
+        $map = @{}
+        foreach ($r in $res) {
+            $sam = [string](Get-Prop $r 'sAMAccountName')
+            foreach ($spn in (Get-PropAll $r 'servicePrincipalName')) {
+                $key = ([string]$spn).ToLower()
+                if (-not $map.ContainsKey($key)) { $map[$key] = New-Object System.Collections.ArrayList }
+                [void]$map[$key].Add($sam)
+            }
+        }
+        $dups = @()
+        foreach ($k in $map.Keys) {
+            $owners = @($map[$k] | Select-Object -Unique)
+            if ($owners.Count -gt 1) { $dups += @{ 'SPN'=$k; '归属账户'=($owners -join ', ') } }
+        }
+        if ($dups.Count -gt 0) {
+            Add-Finding -Category '配置异常' -Title "存在重复 SPN（$($dups.Count) 个）" -Severity 'Medium' `
+                -Description "同一 SPN 注册在多个账户上会导致 Kerberos 认证异常，也可能是 SPN 劫持/伪造的迹象。" `
+                -Affected $dups `
+                -Remediation "核查重复 SPN 来源，删除多余/异常注册，确保每个 SPN 唯一。" -Reference "SPN 配置审计"
+        } else {
+            Add-Finding -Category '配置异常' -Title '未发现重复 SPN' -Severity 'Info' -Passed $true -Description "所有 SPN 均唯一。"
+        }
+        Write-Step "重复 SPN 检查完成" 'OK'
+    } catch {
+        Write-Step "重复 SPN 检查失败: $($_.Exception.Message)" 'ERR'
+    }
+}
+
+function Test-GmsaReadable {
+    Write-Step "检查 gMSA 口令可读范围 ..." 'RUN'
+    try {
+        $res = Invoke-LdapQuery -Filter '(objectClass=msDS-GroupManagedServiceAccount)' -Properties @('sAMAccountName','msDS-GroupMSAMembership')
+        $rows = @(); $cnt = 0
+        $lowPriv = Get-LowPrivSidTable
+        foreach ($r in $res) {
+            $cnt++
+            $sam = [string](Get-Prop $r 'sAMAccountName')
+            $sids = @()
+            try {
+                $raw = $r.Properties['msDS-GroupMSAMembership'][0]
+                $sd = New-Object System.DirectoryServices.ActiveDirectorySecurity
+                $sd.SetSecurityDescriptorBinaryForm([byte[]]$raw)
+                foreach ($ace in $sd.GetAccessRules($true,$false,[System.Security.Principal.SecurityIdentifier])) { $sids += $ace.IdentityReference.Value }
+            } catch {}
+            $broad = @($sids | Where-Object { $lowPriv.ContainsKey($_) })
+            if ($broad.Count -gt 0) {
+                $names = @(); foreach ($s in $broad) { $names += $lowPriv[$s] }
+                $rows += @{ 'gMSA账户'=$sam; '可读口令的宽泛主体'=(($names | Select-Object -Unique) -join ', ') }
+            }
+        }
+        if ($rows.Count -gt 0) {
+            Add-Finding -Category '凭据窃取' -Title "存在 gMSA 口令可被宽泛主体读取（$($rows.Count) 个）" -Severity 'High' `
+                -Description "gMSA 的 msDS-GroupMSAMembership 决定谁能取回其托管口令。若含 Domain Users/Authenticated Users 等宽泛主体，则低权限用户可获取该服务账户口令。" `
+                -Affected $rows `
+                -Remediation "将 PrincipalsAllowedToRetrieveManagedPassword 收紧为仅运行该服务的特定主机/账户。" -Reference "gMSA 加固"
+        } elseif ($cnt -gt 0) {
+            Add-Finding -Category '凭据窃取' -Title 'gMSA 口令读取范围正常' -Severity 'Info' -Passed $true -Description "检测到 $cnt 个 gMSA，未发现宽泛可读。"
+        } else {
+            Add-Finding -Category '凭据窃取' -Title '未发现 gMSA' -Severity 'Info' -Passed $true -Description "域内未使用组托管服务账户。"
+        }
+        Write-Step "gMSA 检查完成" 'OK'
+    } catch {
+        Write-Step "gMSA 检查失败: $($_.Exception.Message)" 'ERR'
+    }
+}
+
+function Test-StaleComputers {
+    Write-Step "检查僵尸计算机账户 (>$StaleDays 天) ..." 'RUN'
+    try {
+        $threshold = (Get-Date).AddDays(-$StaleDays)
+        $res = Invoke-LdapQuery -Filter '(&(objectCategory=computer)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))' `
+            -Properties @('sAMAccountName','lastLogonTimestamp','pwdLastSet','operatingSystem')
+        $rows = @()
+        foreach ($r in $res) {
+            $llt = Convert-FileTimeToDate (Get-Prop $r 'lastLogonTimestamp')
+            $pwd = Convert-FileTimeToDate (Get-Prop $r 'pwdLastSet')
+            if (($llt -and $llt -lt $threshold) -or ($pwd -and $pwd -lt $threshold)) {
+                $rows += @{
+                    '计算机'=[string](Get-Prop $r 'sAMAccountName')
+                    '系统'=[string](Get-Prop $r 'operatingSystem')
+                    '最近登录'=$(if($llt){$llt.ToString('yyyy-MM-dd')}else{'未知'})
+                    '机器口令年龄(天)'=$(if($pwd){[math]::Round(((Get-Date)-$pwd).TotalDays)}else{0})
+                }
+            }
+        }
+        if ($rows.Count -gt 0) {
+            Add-Finding -Category '账户卫生' -Title "存在僵尸计算机账户（$($rows.Count) 个）" -Severity 'Low' `
+                -Description "这些计算机账户超过 $StaleDays 天未活动（域成员机器口令正常每 30 天自动轮换）。陈旧机器账户可能仍持有有效凭据或被重用。" `
+                -Affected ($rows | Sort-Object { [int]$_['机器口令年龄(天)'] } -Descending) `
+                -Remediation "禁用并在确认后删除长期离线的计算机账户，纳入资产生命周期管理。" -Reference "账户卫生"
+        } else {
+            Add-Finding -Category '账户卫生' -Title '未发现僵尸计算机账户' -Severity 'Info' -Passed $true -Description "计算机账户活跃度正常。"
+        }
+        Write-Step "僵尸计算机检查完成" 'OK'
+    } catch {
+        Write-Step "僵尸计算机检查失败: $($_.Exception.Message)" 'ERR'
+    }
+}
+
+function Test-FunctionalLevelAndLegacyOs {
+    Write-Step "检查域/林功能级别与 EOL 系统 ..." 'RUN'
+    try {
+        $rootDse = Get-DirectoryEntry 'RootDSE'
+        $domFunc = [int]($rootDse.Properties['domainFunctionality'][0])
+        $forestFunc = [int]($rootDse.Properties['forestFunctionality'][0])
+        $rootDse.Dispose()
+        $map = @{ 0='2000';1='2003 Interim';2='2003';3='2008';4='2008 R2';5='2012';6='2012 R2';7='2016' }
+        $domText = if ($map.ContainsKey($domFunc)) { $map[$domFunc] } else { "级别$domFunc" }
+        $forestText = if ($map.ContainsKey($forestFunc)) { $map[$forestFunc] } else { "级别$forestFunc" }
+        if ($domFunc -lt 7 -or $forestFunc -lt 7) {
+            Add-Finding -Category '系统加固' -Title "域/林功能级别偏低（域:$domText 林:$forestText）" -Severity 'Medium' `
+                -Description "较低功能级别意味着仍兼容旧版域控与较弱安全特性（较弱加密、缺少较新的 Kerberos/凭据保护）。" `
+                -Affected @(@{ '域功能级别'=$domText; '林功能级别'=$forestText }) `
+                -Remediation "在确认无旧版域控后，逐步提升域/林功能级别至受支持版本(2016+)。" -Reference "功能级别加固"
+        } else {
+            Add-Finding -Category '系统加固' -Title "域/林功能级别正常（域:$domText 林:$forestText）" -Severity 'Info' -Passed $true -Description "功能级别处于受支持范围。"
+        }
+
+        $res = Invoke-LdapQuery -Filter '(&(objectCategory=computer)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))' -Properties @('sAMAccountName','operatingSystem')
+        $eol = @()
+        foreach ($r in $res) {
+            $os = [string](Get-Prop $r 'operatingSystem')
+            if ($os -match 'XP|Vista|Windows 7|Windows 8|Server 2003|Server 2008|Server 2012') {
+                $eol += @{ '计算机'=[string](Get-Prop $r 'sAMAccountName'); '系统'=$os }
+            }
+        }
+        if ($eol.Count -gt 0) {
+            Add-Finding -Category '系统加固' -Title "存在已停止支持(EOL)的成员系统（$($eol.Count) 台）" -Severity 'High' `
+                -Description "这些主机运行已结束支持的 Windows，缺少安全更新，是内网横向移动的高危跳板。" `
+                -Affected $eol `
+                -Remediation "尽快升级或网络隔离这些 EOL 主机，并加强监控。" -Reference "EOL 系统风险"
+        }
+        Write-Step "功能级别/EOL 检查完成" 'OK'
+    } catch {
+        Write-Step "功能级别/EOL 检查失败: $($_.Exception.Message)" 'ERR'
+    }
+}
+
+function Test-SensitiveNotDelegated {
+    Write-Step "检查特权账户是否标记为不可委派 ..." 'RUN'
+    try {
+        $protected = @{}
+        foreach ($m in (Resolve-GroupMembers -GroupRid '525')) { $protected[$m.sAMAccountName] = $true }
+        $res = Invoke-LdapQuery -Filter '(&(objectCategory=person)(objectClass=user)(adminCount=1))' -Properties @('sAMAccountName','userAccountControl')
+        $rows = @()
+        foreach ($r in $res) {
+            $uac = [int](Get-Prop $r 'userAccountControl' 0)
+            if (Test-UacFlag $uac $script:UAC.ACCOUNTDISABLE) { continue }
+            $sam = [string](Get-Prop $r 'sAMAccountName')
+            if ($sam -eq 'krbtgt') { continue }
+            $notDelegated = Test-UacFlag $uac $script:UAC.NOT_DELEGATED
+            if (-not $notDelegated -and -not $protected.ContainsKey($sam)) { $rows += @{ '特权账户'=$sam } }
+        }
+        if ($rows.Count -gt 0) {
+            Add-Finding -Category '特权账户' -Title "特权账户未标记『敏感，不可委派』（$($rows.Count) 个）" -Severity 'Medium' `
+                -Description "未设置 NOT_DELEGATED 且不在 Protected Users 的特权账户，其凭据可能被委派给被攻陷的服务从而被冒充。" `
+                -Affected $rows `
+                -Remediation "为特权账户勾选『账户敏感，不能被委派』(NOT_DELEGATED)，或加入 Protected Users 组。" -Reference "委派防护"
+        } else {
+            Add-Finding -Category '特权账户' -Title '特权账户均已防委派' -Severity 'Info' -Passed $true -Description "特权账户已标记不可委派或已在 Protected Users。"
+        }
+        Write-Step "不可委派检查完成" 'OK'
+    } catch {
+        Write-Step "不可委派检查失败: $($_.Exception.Message)" 'ERR'
+    }
+}
+
+function Test-FineGrainedPasswordPolicies {
+    Write-Step "检查细粒度密码策略 (PSO) ..." 'RUN'
+    try {
+        $psoRoot = "CN=Password Settings Container,CN=System,$($script:DomainDN)"
+        $res = Invoke-LdapQuery -Filter '(objectClass=msDS-PasswordSettings)' `
+            -Properties @('name','msDS-MinimumPasswordLength','msDS-PasswordSettingsPrecedence','msDS-PSOAppliesTo') -SearchRoot $psoRoot
+        $rows = @()
+        foreach ($r in $res) {
+            $rows += @{
+                'PSO'=[string](Get-Prop $r 'name')
+                '最小长度'=[int](Get-Prop $r 'msDS-MinimumPasswordLength' 0)
+                '优先级'=[int](Get-Prop $r 'msDS-PasswordSettingsPrecedence' 0)
+                '应用对象数'=(Get-PropAll $r 'msDS-PSOAppliesTo').Count
+            }
+        }
+        if ($rows.Count -eq 0) {
+            Add-Finding -Category '密码策略' -Title '未配置细粒度密码策略 (PSO)' -Severity 'Low' `
+                -Description "全域仅依赖单一默认密码策略，无法对特权/服务账户单独加严口令要求。" `
+                -Remediation "为特权账户、服务账户创建更严格的 PSO（更长口令、更短有效期）。" -Reference "FGPP/PSO"
+        } else {
+            Add-Finding -Category '密码策略' -Title "已配置 $($rows.Count) 个细粒度密码策略 (PSO)" -Severity 'Info' -Passed $true `
+                -Description "PSO 清单（建议核对其强度与应用范围是否覆盖特权/服务账户）。" -Affected $rows
+        }
+        Write-Step "PSO 检查完成" 'OK'
+    } catch {
+        Write-Step "PSO 检查失败: $($_.Exception.Message)" 'ERR'
+    }
+}
+
+#endregion
+
+
 #region ========================= HTML 报告生成 =========================
 
 function ConvertTo-HtmlEncoded {
@@ -1484,22 +2034,35 @@ function Invoke-Main {
         'Test-MachineAccountQuota',
         'Test-KrbtgtPassword',
         'Test-DomainControllers',
+        'Test-FunctionalLevelAndLegacyOs',
         'Test-DomainTrusts',
+        'Test-AnonymousLdapAccess',
+        'Test-AdcsTemplates',
         'Test-Kerberoastable',
         'Test-AsRepRoastable',
+        'Test-WeakKerberosEncryption',
         'Test-UnconstrainedDelegation',
         'Test-ConstrainedDelegation',
         'Test-ResourceBasedDelegation',
         'Test-DangerousUacFlags',
         'Test-PasswordNeverExpires',
+        'Test-FineGrainedPasswordPolicies',
         'Test-StaleAccounts',
+        'Test-StaleComputers',
         'Test-PrivilegedOldPasswords',
         'Test-SidHistory',
         'Test-PrivilegedGroups',
+        'Test-HighRiskGroups',
         'Test-ProtectedUsers',
+        'Test-SensitiveNotDelegated',
+        'Test-BuiltinAdminAndGuest',
+        'Test-PreWindows2000Access',
         'Test-Laps',
+        'Test-GmsaReadable',
         'Test-DCSyncRights',
         'Test-OrphanedAdminCount',
+        'Test-DuplicateSpn',
+        'Test-SecretsInAttributes',
         'Test-GppPassword'
     )
     foreach ($c in $checks) {

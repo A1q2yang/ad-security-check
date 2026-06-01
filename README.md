@@ -43,6 +43,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 | `-StaleDays` | 判定“僵尸 / 不活跃账户”的天数阈值 | `90` |
 | `-OldPasswordDays` | 判定“口令过旧”（重点特权账户）的天数阈值 | `365` |
 | `-SkipSysvolCheck` | 跳过 SYSVOL 中 GPP cpassword 文件扫描 | 关闭 |
+| `-SysvolTimeoutSeconds` | SYSVOL 扫描超时（秒），超时自动跳过 | `120` |
 
 ### 示例
 
@@ -60,31 +61,77 @@ $cred = Get-Credential
 
 ---
 
-## 检查项一览
+## 检查项一览（共 34 项）
 
-| 类别 | 检查项 | 关注的风险 |
-|------|--------|-----------|
-| 密码策略 | 默认域密码策略 | 弱口令、可在线爆破 / 喷洒 (T1110) |
-| 权限提升面 | 机器账户配额 (MachineAccountQuota) | RBCD / noPac (CVE-2021-42278/42287) |
-| Kerberos / 持久化 | krbtgt 口令老化 | 黄金票据 (T1558.001) |
-| 基线信息 | 域控清单与系统版本 | EOL 系统、ZeroLogon 等 |
-| 信任关系 | 域 / 林信任、SID Filtering | SID History 跨域提权 (T1134.005) |
-| Kerberos / 凭据窃取 | 可 Kerberoasting 的 SPN 账户 | Kerberoasting (T1558.003) |
-| Kerberos / 凭据窃取 | 关闭预认证的账户 | AS-REP Roasting (T1558.004) |
-| Kerberos / 委派 | 非约束委派 | 攻陷即可冒充域管，配合 PetitPotam |
-| Kerberos / 委派 | 约束委派 (含协议转换) | S4U 冒充任意用户 |
-| Kerberos / 委派 | 基于资源的约束委派 (RBCD) | 常见提权链终点 |
-| 账户卫生 | 口令非必需 / 可逆加密 / 仅 DES | 空口令、明文还原、弱加密 |
-| 账户卫生 | 口令永不过期（含特权） | 凭据长期有效 (T1078) |
-| 账户卫生 | 僵尸 / 不活跃账户 | 被忽视的突破口 |
-| 特权账户 | 特权账户口令老化 | 历史泄露危害大 |
-| 持久化 / 提权 | SID History | 隐蔽提权 / 持久化 (T1134.005) |
-| 特权账户 | 特权组成员（递归） | 过度授权、组内含计算机账户 |
-| 特权账户 | Protected Users 覆盖 | 管理员凭据保护不足 |
-| 系统加固 | LAPS 部署情况 | 统一本地管理员口令、横向移动 |
-| ACL / 凭据窃取 | DCSync (目录复制) 权限 | 远程导出全部哈希 (T1003.006) |
-| 特权账户 | 孤立 adminCount 账户 | 隐性特权遗留 (AdminSDHolder) |
-| 凭据窃取 | SYSVOL GPP cpassword | MS14-025 明文口令 (T1552.006) |
+### 域级别策略 / 基线
+
+| 检查项 | 关注的风险 |
+|---|---|
+| 默认域密码策略 | 弱口令、可在线爆破 / 喷洒 (T1110) |
+| 细粒度密码策略 (PSO) | 特权/服务账户口令未单独加严 |
+| 机器账户配额 (MachineAccountQuota) | RBCD / noPac (CVE-2021-42278/42287) |
+| krbtgt 口令老化 | 黄金票据 (T1558.001) |
+| 域控清单与操作系统 | EOL 系统、ZeroLogon 等 |
+| 域/林功能级别 + 成员 EOL 系统 | 弱加密、缺少现代凭据保护 |
+| 域 / 林信任 + SID Filtering | SID History 跨域提权 (T1134.005) |
+| 匿名 LDAP / dsHeuristics | 匿名枚举目录 |
+
+### Kerberos / 委派
+
+| 检查项 | 关注的风险 |
+|---|---|
+| 可 Kerberoasting 的 SPN 账户 | Kerberoasting (T1558.003) |
+| 关闭 Kerberos 预认证的账户 | AS-REP Roasting (T1558.004) |
+| 弱 Kerberos 加密 (RC4/DES) | 票据更易破解 |
+| 非约束委派 | 攻陷主机即可冒充任意用户（配合 PetitPotam） |
+| 约束委派（含协议转换） | S4U 冒充任意用户 |
+| 基于资源的约束委派 (RBCD) | 常见提权链终点 |
+
+### 账户卫生
+
+| 检查项 | 关注的风险 |
+|---|---|
+| 口令非必需 / 可逆加密 / 仅 DES | 空口令、明文还原、弱加密 |
+| 口令永不过期（含特权） | 凭据长期有效 (T1078) |
+| 僵尸 / 不活跃用户账户 | 被忽视的突破口 |
+| 僵尸计算机账户 | 陈旧机器账户与凭据 |
+| 内置 Administrator (RID 500) 卫生 | 未改名 / 口令老化 |
+| Guest (来宾) 账户启用状态 | 弱身份入口 |
+| Pre-Windows 2000 Compatible Access 含宽泛主体 | 匿名枚举 |
+
+### 特权账户与防护
+
+| 检查项 | 关注的风险 |
+|---|---|
+| 特权账户口令老化 | 历史泄露危害大 |
+| SID History | 隐蔽提权 / 持久化 (T1134.005) |
+| 特权组成员（递归） | 过度授权、组内含计算机账户 |
+| 高危易忽视组（DnsAdmins 等） | DnsAdmins → DC 代码执行 |
+| Protected Users 覆盖 | 管理员凭据保护不足 |
+| 特权账户『敏感，不可委派』标志 | 凭据被委派窃取 |
+| 孤立 adminCount 账户 | 隐性特权遗留 (AdminSDHolder) |
+
+### 凭据窃取面
+
+| 检查项 | 关注的风险 |
+|---|---|
+| LAPS 部署情况 | 统一本地管理员口令、横向移动 |
+| gMSA 口令可读范围 (msDS-GroupMSAMembership) | 服务账户凭据泄露 |
+| 账户属性中的明文口令 / 可读机密 | description/info 含口令、userPassword 可读 (T1552) |
+| DCSync (目录复制) 权限 | 远程导出全部哈希 (T1003.006) |
+| SYSVOL GPP cpassword | MS14-025 明文口令 (T1552.006) |
+
+### AD CS 证书服务
+
+| 检查项 | 关注的风险 |
+|---|---|
+| 证书模板 ESC1 / ESC2 / ESC3 / ESC4 | 域接管的现代主流路径 |
+
+### 配置异常
+
+| 检查项 | 关注的风险 |
+|---|---|
+| 重复 SPN | 配置错误 / SPN 劫持迹象 |
 
 ---
 
