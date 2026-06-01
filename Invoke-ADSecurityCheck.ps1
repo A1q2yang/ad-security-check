@@ -33,6 +33,9 @@
 .PARAMETER SkipSysvolCheck
     跳过 SYSVOL 中 GPP cpassword 的文件扫描（该项需要访问 \\domain\SYSVOL）。
 
+.PARAMETER SysvolTimeoutSeconds
+    SYSVOL GPP 扫描的最长耗时（秒）。超时将自动跳过，避免在大型域/慢网络下卡住。默认 120 秒。
+
 .EXAMPLE
     .\Invoke-ADSecurityCheck.ps1
 
@@ -52,7 +55,8 @@ param(
     [System.Management.Automation.PSCredential]$Credential,
     [int]$StaleDays = 90,
     [int]$OldPasswordDays = 365,
-    [switch]$SkipSysvolCheck
+    [switch]$SkipSysvolCheck,
+    [int]$SysvolTimeoutSeconds = 120
 )
 
 #region ========================= 全局状态 =========================
@@ -1107,27 +1111,63 @@ function Test-GppPassword {
         Write-Step "已按参数跳过 SYSVOL GPP cpassword 扫描" 'WARN'
         return
     }
-    Write-Step "扫描 SYSVOL 中的 GPP cpassword（已加密的策略口令）..." 'RUN'
+    Write-Step "扫描 SYSVOL 中的 GPP cpassword（仅扫 Preferences 目录，限时 $SysvolTimeoutSeconds 秒）..." 'RUN'
     try {
         # 取域 DNS 名
         $domainDns = ($script:DomainDN -replace 'DC=','' -replace ',', '.')
         $sysvol = "\\$domainDns\SYSVOL\$domainDns\Policies"
-        if (-not (Test-Path $sysvol)) {
+
+        # 在后台作业中执行文件遍历，并设置超时，避免大型域 / 慢网络下长时间无响应。
+        # 同时仅深入每个 GPO 的 Machine\Preferences 与 User\Preferences 目录
+        # （GPP cpassword 只可能出现在这里），避免遍历整棵策略树。
+        $job = Start-Job -ScriptBlock {
+            param($policiesPath)
+            $targetNames = 'Groups.xml','Services.xml','ScheduledTasks.xml','DataSources.xml','Printers.xml','Drives.xml'
+            if (-not (Test-Path $policiesPath)) { return ,@('__NOPATH__') }
+            $hits = New-Object System.Collections.ArrayList
+            $gpoDirs = Get-ChildItem -Path $policiesPath -Directory -ErrorAction SilentlyContinue
+            foreach ($gpo in $gpoDirs) {
+                foreach ($scope in 'Machine','User') {
+                    $pref = Join-Path $gpo.FullName "$scope\Preferences"
+                    if (Test-Path $pref) {
+                        $files = Get-ChildItem -Path $pref -Recurse -File -Include $targetNames -ErrorAction SilentlyContinue
+                        foreach ($f in $files) {
+                            try {
+                                $c = Get-Content -LiteralPath $f.FullName -Raw -ErrorAction SilentlyContinue
+                                if ($c -match 'cpassword="([^"]+)"') { [void]$hits.Add($f.FullName) }
+                            } catch {}
+                        }
+                    }
+                }
+            }
+            return ,@($hits)
+        } -ArgumentList $sysvol
+
+        $done = Wait-Job -Job $job -Timeout $SysvolTimeoutSeconds
+        if (-not $done) {
+            Stop-Job -Job $job -ErrorAction SilentlyContinue
+            Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+            Write-Step "SYSVOL 扫描超时（>$SysvolTimeoutSeconds 秒），已跳过" 'WARN'
+            Add-Finding -Category '凭据窃取' -Title 'SYSVOL GPP 扫描超时未完成' -Severity 'Low' `
+                -Description "SYSVOL 文件遍历超过 $SysvolTimeoutSeconds 秒（可能因 GPO 数量多或网络较慢）。本项未完成，请手工补充核查。" `
+                -Remediation "可用 -SysvolTimeoutSeconds 增大超时阈值，或用 -SkipSysvolCheck 跳过；亦可在域控本地直接核查 Policies 目录中各 GPO 的 Preferences\*.xml 是否含 cpassword。"
+            return
+        }
+
+        $result = @(Receive-Job -Job $job -ErrorAction SilentlyContinue)
+        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+
+        if ($result.Count -ge 1 -and $result[0] -eq '__NOPATH__') {
             Write-Step "无法访问 $sysvol，跳过" 'WARN'
             Add-Finding -Category '凭据窃取' -Title 'SYSVOL GPP 扫描未完成' -Severity 'Low' `
                 -Description "无法访问 $sysvol，未能完成 GPP cpassword 扫描。" `
                 -Remediation "确认终端可访问 SYSVOL 共享后重试，或在域控本地排查 Policies 目录。"
             return
         }
-        $xmlFiles = Get-ChildItem -Path $sysvol -Recurse -Include 'Groups.xml','Services.xml','ScheduledTasks.xml','DataSources.xml','Printers.xml','Drives.xml' -ErrorAction SilentlyContinue
+
         $hits = @()
-        foreach ($f in $xmlFiles) {
-            try {
-                $content = Get-Content -Path $f.FullName -Raw -ErrorAction SilentlyContinue
-                if ($content -match 'cpassword="([^"]+)"') {
-                    $hits += @{ '策略文件' = $f.FullName; '说明' = '包含 cpassword 字段（微软固定 AES 密钥可解密为明文）' }
-                }
-            } catch {}
+        foreach ($p in $result) {
+            if ($p) { $hits += @{ '策略文件' = [string]$p; '说明' = '包含 cpassword 字段（微软固定 AES 密钥可解密为明文）' } }
         }
         if ($hits.Count -gt 0) {
             Add-Finding -Category '凭据窃取' -Title "SYSVOL 中发现 GPP cpassword（$($hits.Count) 处）" -Severity 'Critical' `
